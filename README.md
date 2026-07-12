@@ -7,7 +7,8 @@
 
 配套 **systemd 自动重打**：飞书自动更新覆盖补丁后自动重新打上，装一次基本一劳永逸。
 
-> 💡 **防撤回缓存法思路参考 Windows「吾乐吧」补丁 [flydoos/FeiShuRevokeMsgPatcher](https://github.com/flydoos/FeiShuRevokeMsgPatcher)**。
+> 💡 **防撤回**缓存法思路参考 Windows「吾乐吧」补丁 [flydoos/FeiShuRevokeMsgPatcher](https://github.com/flydoos/FeiShuRevokeMsgPatcher)；
+> **防已读**思路参考 [starccy/feishu-unreadme](https://github.com/starccy/feishu-unreadme)。
 >
 > 📌 **当前实测生效版本：飞书 Linux `7.58.14`**（记录于 2026-07）。其它版本可能因 minified JS 结构变化需重新锚定正则，脚本失配时会中止且不改原文件。
 
