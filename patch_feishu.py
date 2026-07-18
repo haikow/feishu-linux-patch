@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-飞书 Linux 桌面端补丁：已读→对方显示未读 + 防撤回(渲染门控 + 内容缓存)
+飞书 Linux 桌面端补丁：已读→对方未读(但你回复后才把可视消息标已读, 复刻吾乐吧) + 防撤回(渲染门控 + 内容缓存)
 用法: sudo python3 patch_feishu.py [飞书安装根目录]   (默认 /opt/bytedance/feishu)
 说明: 每次飞书自动更新后重跑本脚本即可。会先备份为 messenger-next.asar.bak。
 
@@ -18,9 +18,27 @@ from asar import Asar
 ROOT = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("/opt/bytedance/feishu")
 WORK = Path("/tmp/feishu-patch-build")
 
-# ---- 补丁 1: 已读未读(清空已读回执上报的 messageIds) ----
+# ---- 补丁 1: 已读→对方未读, 但【回复才已读】(复刻吾乐吧行为) ----
+# 已读上报都汇到单一 sender(updateMessagesMeRead)。原来无条件 t.messageIds=[] => 全程未读。
+# 改成门控: 仅在"刚发送"的 2.5s 窗口内放行, 否则清空。=> 纯浏览未读, 回复后可视消息已读。
+# 注意: sender 在 SDK realm; 用 globalThis(worker 无 window, 用 window 会崩页面); 窗口须开在
+# 与 sender 同 realm 的发送函数(sendMessage/sendMessageV2)里, onSendMessageSuccess 在 renderer
+# realm globalThis 不共享(实测传不过去)。
 UNREAD_PAT = re.compile(rb'\w+\.\w+\.info\("updateMessagesMeRead"')
-UNREAD_INJECT = b"t.messageIds=[],"
+UNREAD_INJECT = b"t.messageIds=(globalThis.__flReadWin&&Date.now()<globalThis.__flReadWin?t.messageIds:[]),"
+# 发送时开放已读窗口(多 realm / 多形态)
+SEND_PATS = [
+    (re.compile(rb'(onSendMessageSuccess=e=>\{)(?!globalThis\.__flReadWin)'),
+     rb'\g<1>globalThis.__flReadWin=Date.now()+2500;'),
+    (re.compile(rb'(sendMessageV2:function\(e\)\{)(?!globalThis\.__flReadWin)'),
+     rb'\g<1>globalThis.__flReadWin=Date.now()+2500;'),
+    (re.compile(rb'(sendMessage:function\(e,t\)\{)(?!globalThis\.__flReadWin)'),
+     rb'\g<1>globalThis.__flReadWin=Date.now()+2500;'),
+    (re.compile(rb'sendMessage:([A-Z]),resendMessage'),
+     rb'sendMessage:function(){globalThis.__flReadWin=Date.now()+2500;return \g<1>.apply(this,arguments)},resendMessage'),
+    (re.compile(rb'sendMessageV2:([A-Z])\}\}'),
+     rb'sendMessageV2:function(){globalThis.__flReadWin=Date.now()+2500;return \g<1>.apply(this,arguments)}}}'),
+]
 
 # ---- 补丁 2: 防撤回·渲染门控(撤回气泡占位置死, 可能已被新版结构取代, 命中与否都不阻断) ----
 RECALL_MAIN = re.compile(rb'if\([a-z_$]&&![a-z_$]&&!\(0,[a-z_$]\.[a-z_$]\)\([A-Za-z_$]\)\)return this\.renderRecalledMessage\(\)')
@@ -98,7 +116,7 @@ def main():
     with Asar.open(src) as a:
         a.extract(WORK)
 
-    n_unread = n_gate = n_cache_w = n_cache_r = 0
+    n_unread = n_send = n_gate = n_cache_w = n_cache_r = 0
     for js in WORK.rglob("*.js"):
         try:
             b = js.read_bytes()
@@ -125,22 +143,28 @@ def main():
             if cr and b'window.__flRecallText=' not in orig:
                 b = RECALL_HELPER + b
 
-        # 1) 已读未读(首个命中点前插入, 幂等)
+        # 1) 已读门控(回复才放行, 首个命中点前插入, 幂等)
         m = UNREAD_PAT.search(b)
         if m and b[max(0, m.start()-len(UNREAD_INJECT)):m.start()] != UNREAD_INJECT:
             b = b[:m.start()] + UNREAD_INJECT + b[m.start():]
             n_unread += 1
 
+        # 1b) 发送开窗(多 realm / 多形态)
+        for pat, rep in SEND_PATS:
+            b, cs = pat.subn(rep, b)
+            n_send += cs
+
         if b != orig:
             js.write_bytes(b)
 
-    print(f"[已读未读]      注入点: {n_unread}")
-    print(f"[防撤回·门控]   中和:   {n_gate}  (新版可能为0, 不影响)")
-    print(f"[防撤回·缓存写] upsertPreviews 注入: {n_cache_w}")
-    print(f"[防撤回·缓存读] 撤回提示拼接:        {n_cache_r}")
+    print(f"[已读门控·回复放行] 注入点: {n_unread}")
+    print(f"[发送开窗]          注入点: {n_send}")
+    print(f"[防撤回·门控]       中和:   {n_gate}  (新版可能为0, 不影响)")
+    print(f"[防撤回·缓存写]     注入:   {n_cache_w}")
+    print(f"[防撤回·缓存读]     拼接:   {n_cache_r}")
 
-    # 核心是缓存法(写+读都要命中); 已读未读也必须命中
-    if n_unread == 0 or n_cache_w == 0 or n_cache_r == 0:
+    # 核心是缓存法(写+读都要命中); 已读门控 + 发送开窗也必须命中
+    if n_unread == 0 or n_send == 0 or n_cache_w == 0 or n_cache_r == 0:
         sys.exit("❌ 关键补丁点未命中，疑似版本不兼容，已中止（未改动原文件）")
 
     Asar.pack(WORK, str(asar))

@@ -3,7 +3,7 @@
 给飞书 Linux 桌面版（Electron，`/opt/bytedance/feishu`）打两个补丁，**一个脚本搞定**：
 
 - 🕵️ **防撤回**：对方撤回的消息，你仍能看到原文 —— 显示为「xxx撤回了一条消息**: 原文内容**」。
-- 👀 **防对方已读**：你看过对方（私聊/群聊）的消息后，**对方界面仍显示「未读」**。
+- 👀 **防对方已读（回复才已读）**：你**只看不回**时，对方界面一直显示「未读」；只有你**回复**后，才把可视范围的消息标记为已读 —— 更自然、不易被察觉（复刻 Windows 吾乐吧行为）。
 
 配套 **systemd 自动重打**：飞书自动更新覆盖补丁后自动重新打上，装一次基本一劳永逸。
 
@@ -25,10 +25,19 @@
 1. **撤回前**：在会话预览更新（`upsertPreviews`）时，把每条消息的 `{id, 内容}` 存进 `localStorage`；
 2. **撤回时**：系统提示渲染处按消息 id 取回缓存，拼到提示后面。
 
-### 防对方已读
-飞书看过消息后会调用 `…info("updateMessagesMeRead", { …messageIds })` 把已读 id 上报服务器。
-补丁在该调用前注入 `t.messageIds=[],` 清空上报列表 → 服务器收不到你的已读回执，对方一直显示未读。
-（你本地 UI 照常显示已读，本地读状态独立。）
+### 防对方已读（回复才已读）
+飞书看过消息后会调用 `…info("updateMessagesMeRead", { …messageIds })` 把已读 id 上报服务器。所有触发（滚动看到 / 回复）都汇到这一个上报函数。
+
+补丁把它改成**门控**：只在你**刚发送消息的 2.5 秒窗口内**放行上报，否则清空 →
+- 纯浏览（窗口外）→ 上报被清空 → 对方一直未读；
+- 你回复后（窗口内）→ 飞书对可视消息的已读上报被放行 → 对方看到已读。
+
+```js
+t.messageIds = (globalThis.__flReadWin && Date.now() < globalThis.__flReadWin) ? t.messageIds : []
+```
+窗口在发送函数（`sendMessage`/`sendMessageV2`）里开启：`globalThis.__flReadWin = Date.now()+2500`。
+
+> ⚠️ 两个易错点：① 已读上报跑在 **web worker**，必须用 `globalThis`（用 `window` 会 `ReferenceError` 崩整页）；② 窗口必须开在**与上报函数同一 realm** 的发送函数里（开在 renderer 侧的 `onSendMessageSuccess` 里 `globalThis` 不共享、传不过去）。
 
 > 详细逆向过程见 [`docs/防撤回-复盘-封档误判到缓存法破局.md`](docs/防撤回-复盘-封档误判到缓存法破局.md)。
 
@@ -55,9 +64,10 @@ pkill -9 -x feishu ; /opt/bytedance/feishu/feishu &
 
 首次运行会把原 asar 备份为 `messenger-next.asar.bak`。输出示例：
 ```
-[已读未读]      注入点: 2
-[防撤回·缓存写] upsertPreviews 注入: 1
-[防撤回·缓存读] 撤回提示拼接: 2
+[已读门控·回复放行] 注入点: 2
+[发送开窗]          注入点: 9
+[防撤回·缓存写]     注入: 1
+[防撤回·缓存读]     拼接: 2
 ✅ 已写入 …/messenger-next.asar
 ```
 
@@ -95,7 +105,7 @@ pkill -9 -x feishu ; /opt/bytedance/feishu/feishu &
 ```bash
 ASAR=/opt/bytedance/feishu/webcontent/messenger-next.asar
 grep -c recalledMessageCacheList "$ASAR"   # 防撤回 >0
-grep -cF 't.messageIds=[],' "$ASAR"        # 防已读 =2
+grep -cF '__flReadWin' "$ASAR"             # 防已读(回复才已读) >0
 ```
 
 ---
